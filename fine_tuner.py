@@ -12,7 +12,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("fine_tuning.log"),
+        logging.FileHandler("app_log/fine_tuning.log"),
         logging.StreamHandler()
     ]
 )

@@ -18,7 +18,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("dashboard.log"),
+        logging.FileHandler("app_log/dashboard.log"),
         logging.StreamHandler()
     ]
 )
