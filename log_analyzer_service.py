@@ -26,7 +26,7 @@ class LogInput(BaseModel):
 async def analyze_logs(log_input: LogInput):
     global log_buffer
     raw_logs = log_input.logs
-    log_df = log_analyzer.preprocess_logs(raw_logs)
+    log_df = log_analyzer.preprocess_log(raw_logs)
     results = log_analyzer.analyze_errors(log_df)
 
     log_buffer.extend(log_df.to_dict(orient="records"))
