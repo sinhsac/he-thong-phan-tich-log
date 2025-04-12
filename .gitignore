@@ -3,3 +3,7 @@
 
 log_classifier_5_labels
 templates/
+/app_log/dashboard.log
+/app_log/fine_tuning.log
+/app_log/service.log
+/app_log/forecaster.log
