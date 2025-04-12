@@ -83,8 +83,15 @@ async def analyze_logs(log_input: LogInput, background_tasks: BackgroundTasks):
         # Phân tích lỗi
         results = log_analyzer.analyze_errors(log_df)
 
+        # Lọc log có confidence cao để thêm vào buffer cho fine-tune
+        log_records = []
+        for record in results["results"]:
+            analysis = record["analysis"]
+            # Chỉ thêm vào buffer nếu confidence > 0.8 để đảm bảo chất lượng dữ liệu
+            if "confidence" in analysis and analysis["confidence"] > 0.8 and "type" in analysis:
+                log_records.append(analysis)
+
         # Thêm vào buffer để fine-tune sau
-        log_records = log_df.to_dict(orient="records")
         log_buffer.extend(log_records)
 
         # Dự đoán xu hướng lỗi trong tương lai
@@ -214,6 +221,67 @@ async def trigger_fine_tuning():
         raise HTTPException(status_code=500, detail=f"Lỗi khi fine-tune mô hình: {str(e)}")
 
 
+# Thêm trong file log_analyzer_service.py
+
+class ManualLabelInput(BaseModel):
+    log_id: str = Field(..., description="ID của log cần gán nhãn")
+    type: str = Field(..., description="Loại lỗi để gán (database, server, network, application, security)")
+    confidence: float = Field(1.0, description="Độ tin cậy của nhãn (0.0-1.0)")
+
+
+@app.post("/manual-label", tags=["ML"])
+async def manual_label_log(input_data: ManualLabelInput):
+    """
+    Gán nhãn thủ công cho log để cải thiện dữ liệu training
+    """
+    try:
+        # Lấy lịch sử log
+        log_history = log_analyzer.get_log_history()
+
+        if log_history.empty:
+            return {
+                "success": False,
+                "message": "Không có log nào trong lịch sử"
+            }
+
+        # Kiểm tra loại lỗi có hợp lệ không
+        if input_data.type not in log_analyzer.labels:
+            return {
+                "success": False,
+                "message": f"Loại lỗi không hợp lệ. Các loại lỗi hợp lệ: {', '.join(log_analyzer.labels)}"
+            }
+
+        # Thêm vào buffer để fine-tune
+        global log_buffer
+
+        # Tìm log theo ID (hoặc có thể dựa vào timestamp nếu không có ID)
+        matching_logs = [log for log in log_analyzer.log_history
+                         if "id" in log and log["id"] == input_data.log_id]
+
+        if not matching_logs:
+            return {
+                "success": False,
+                "message": f"Không tìm thấy log với ID {input_data.log_id}"
+            }
+
+        # Cập nhật nhãn và độ tin cậy
+        log = matching_logs[0].copy()
+        log["type"] = input_data.type
+        log["confidence"] = input_data.confidence
+        log["manually_labeled"] = True
+
+        # Thêm vào buffer
+        log_buffer.append(log)
+
+        return {
+            "success": True,
+            "message": f"Đã gán nhãn '{input_data.type}' cho log ID {input_data.log_id}"
+        }
+
+    except Exception as e:
+        logger.error(f"Error manual labeling log: {e}")
+        raise HTTPException(status_code=500, detail=f"Lỗi khi gán nhãn thủ công: {str(e)}")
+
 @app.get("/status", tags=["System"])
 async def get_system_status():
     """
@@ -258,21 +326,37 @@ def process_log_buffer():
         # Tạo DataFrame từ buffer
         df = pd.DataFrame(log_buffer)
 
+        # Kiểm tra dữ liệu trong buffer
+        if "type" not in df.columns or "message" not in df.columns:
+            logger.warning("Logs in buffer don't have required columns for fine-tuning")
+            return
+
+        # Kiểm tra phân phối nhãn để đảm bảo chất lượng dữ liệu
+        label_counts = df["type"].value_counts()
+        logger.info(f"Label distribution: {label_counts.to_dict()}")
+
+        # Chỉ tiếp tục nếu có ít nhất 2 nhãn khác nhau và mỗi nhãn có ít nhất 3 mẫu
+        if len(label_counts) < 2 or label_counts.min() < 3:
+            logger.warning("Insufficient label distribution for effective fine-tuning")
+            return
+
         # Lưu vào file để backup
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         os.makedirs("log_backups", exist_ok=True)
         df.to_csv(f"log_backups/logs_{timestamp}.csv", index=False)
 
         # Chuẩn bị dữ liệu cho fine-tune
-        if "type" in df.columns and "message" in df.columns:
-            fine_tune_data = df[["message", "type"]].rename(columns={"type": "label"})
-            fine_tuner.fine_tune(fine_tune_data)
-        else:
-            logger.warning("Logs in buffer don't have required columns for fine-tuning")
+        fine_tune_data = df[["message", "type"]].rename(columns={"type": "label"})
 
-        # Xóa buffer
-        log_buffer = []
-        logger.info("Fine-tuning completed and buffer cleared")
+        # Thực hiện fine-tune
+        success = fine_tuner.fine_tune(fine_tune_data)
+
+        if success:
+            logger.info(f"Fine-tuning completed successfully with {len(fine_tune_data)} samples")
+            # Xóa buffer chỉ khi fine-tune thành công
+            log_buffer = []
+        else:
+            logger.warning("Fine-tuning failed, keeping buffer for next attempt")
 
     except Exception as e:
         logger.error(f"Error processing log buffer: {e}")
