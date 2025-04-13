@@ -7,3 +7,4 @@ templates/
 /app_log/fine_tuning.log
 /app_log/service.log
 /app_log/forecaster.log
+__pycache__

@@ -13,6 +13,11 @@ import json
 import os
 import logging
 
+import sys
+import io
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
 # Thiết lập logging
 logging.basicConfig(
     level=logging.INFO,
@@ -53,6 +58,7 @@ DEFAULT_TEMPLATE = """
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/js/bootstrap.bundle.min.js"></script>
     <style>
         .card {
             margin-bottom: 20px;
@@ -69,6 +75,12 @@ DEFAULT_TEMPLATE = """
         }
         .chart-container {
             height: 300px;
+        }
+        .log-message {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 300px;
         }
     </style>
 </head>
@@ -143,20 +155,284 @@ DEFAULT_TEMPLATE = """
                 </div>
             </div>
         </div>
+
+        <div class="row mt-3">
+            <div class="col-md-12">
+                <div class="card">
+                    <div class="card-header">
+                        <h5>Manual Labeling</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="alert alert-info">
+                            Select logs to manually label for improving model accuracy
+                        </div>
+                        <div class="table-responsive">
+                            <table class="table table-striped table-hover">
+                                <thead>
+                                    <tr>
+                                        <th>Select</th>
+                                        <th>Timestamp</th>
+                                        <th>Level</th>
+                                        <th>Current Type</th>
+                                        <th>Message</th>
+                                        <th>Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="labelingTable">
+                                    <!-- Logs for labeling will be loaded here -->
+                                </tbody>
+                            </table>
+                        </div>
+                        <div class="row mt-3">
+                            <div class="col-md-4">
+                                <select id="labelType" class="form-select">
+                                    <option value="">Select error type...</option>
+                                    <option value="database">Database</option>
+                                    <option value="server">Server</option>
+                                    <option value="network">Network</option>
+                                    <option value="application">Application</option>
+                                    <option value="security">Security</option>
+                                </select>
+                            </div>
+                            <div class="col-md-4">
+                                <select id="confidenceLevel" class="form-select">
+                                    <option value="1.0">High Confidence (1.0)</option>
+                                    <option value="0.8">Medium Confidence (0.8)</option>
+                                    <option value="0.6">Low Confidence (0.6)</option>
+                                </select>
+                            </div>
+                            <div class="col-md-4">
+                                <button id="applyLabelsBtn" class="btn btn-primary">Apply Labels</button>
+                                <button id="exportForTrainingBtn" class="btn btn-success ms-2">Export for Training</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal xác nhận -->
+    <div class="modal fade" id="confirmExportModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Confirm Export</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <p>Are you sure you want to export <span id="exportCount">0</span> labeled logs for training?</p>
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="includeUnlabeled" checked>
+                        <label class="form-check-label" for="includeUnlabeled">
+                            Include unlabeled logs (for contrastive learning)
+                        </label>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-primary" id="confirmExportBtn">Export</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal kết quả -->
+    <div class="modal fade" id="exportResultModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Export Result</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body" id="exportResultBody">
+                    <!-- Result message will be shown here -->
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-primary" data-bs-dismiss="modal">OK</button>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
-        // Load dashboard data
-        function loadDashboardData() {
-            fetch('/api/dashboard-data')
-                .then(response => response.json())
-                .then(data => {
-                    updateLogSummary(data.log_summary);
-                    updateErrorDistribution(data.error_distribution);
-                    updateForecast(data.forecast);
-                    updateRecentLogs(data.recent_logs);
+        // Biến lưu trữ log data
+        let allLogsData = [];
+        let selectedLogs = [];
+
+        // Hàm cập nhật bảng gán nhãn
+        function updateLabelingTable(logs) {
+            const tableBody = document.getElementById('labelingTable');
+            tableBody.innerHTML = '';
+
+            logs.forEach(log => {
+                const row = document.createElement('tr');
+
+                // Ô checkbox
+                const selectCell = document.createElement('td');
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.className = 'form-check-input log-checkbox';
+                checkbox.dataset.logId = log.timestamp;
+                checkbox.addEventListener('change', function() {
+                    if (this.checked) {
+                        selectedLogs.push(log.timestamp);
+                    } else {
+                        selectedLogs = selectedLogs.filter(id => id !== log.timestamp);
+                    }
+                });
+                selectCell.appendChild(checkbox);
+
+                // Ô timestamp
+                const timestampCell = document.createElement('td');
+                timestampCell.textContent = log.timestamp;
+
+                // Ô level
+                const levelCell = document.createElement('td');
+                const levelBadge = document.createElement('span');
+                levelBadge.className = 'badge ' + 
+                    (log.level === 'critical' ? 'bg-danger' : 
+                     log.level === 'error' ? 'bg-warning' : 
+                     log.level === 'warning' ? 'bg-info' : 'bg-success');
+                levelBadge.textContent = log.level;
+                levelCell.appendChild(levelBadge);
+
+                // Ô current type
+                const typeCell = document.createElement('td');
+                typeCell.textContent = log.type || 'Not classified';
+
+                // Ô message (rút gọn)
+                const messageCell = document.createElement('td');
+                messageCell.className = 'log-message';
+                messageCell.textContent = log.message;
+                messageCell.title = log.message;
+
+                // Ô actions
+                const actionsCell = document.createElement('td');
+                const viewBtn = document.createElement('button');
+                viewBtn.className = 'btn btn-sm btn-outline-primary';
+                viewBtn.textContent = 'View';
+                viewBtn.addEventListener('click', () => showLogDetails(log));
+                actionsCell.appendChild(viewBtn);
+
+                row.appendChild(selectCell);
+                row.appendChild(timestampCell);
+                row.appendChild(levelCell);
+                row.appendChild(typeCell);
+                row.appendChild(messageCell);
+                row.appendChild(actionsCell);
+
+                tableBody.appendChild(row);
+            });
+        }
+
+        // Hàm hiển thị chi tiết log
+        function showLogDetails(log) {
+            alert(`Log Details:\n\nTimestamp: ${log.timestamp}\nLevel: ${log.level}\nType: ${log.type || 'N/A'}\nMessage: ${log.message}`);
+        }
+
+        // Hàm áp dụng nhãn
+        function applyLabels() {
+            const labelType = document.getElementById('labelType').value;
+            const confidence = parseFloat(document.getElementById('confidenceLevel').value);
+
+            if (!labelType) {
+                alert('Please select an error type');
+                return;
+            }
+
+            if (selectedLogs.length === 0) {
+                alert('Please select at least one log');
+                return;
+            }
+
+            const logsToLabel = allLogsData.filter(log => selectedLogs.includes(log.timestamp));
+
+            fetch('/api/manual-label', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    logs: logsToLabel.map(log => ({
+                        log_id: log.timestamp,
+                        type: labelType,
+                        confidence: confidence
+                    }))
                 })
-                .catch(error => console.error('Error loading dashboard data:', error));
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    alert('Labels applied successfully!');
+                    loadDashboardData(); // Refresh data
+                } else {
+                    alert('Error applying labels: ' + data.message);
+                }
+            })
+            .catch(error => {
+                console.error('Error applying labels:', error);
+                alert('Error applying labels');
+            });
+        }
+
+        // Hàm xuất dữ liệu để training
+        function exportForTraining() {
+            const includeUnlabeled = document.getElementById('includeUnlabeled').checked;
+            const logsToExport = includeUnlabeled ? allLogsData : 
+                allLogsData.filter(log => log.type && log.confidence > 0.6);
+
+            document.getElementById('exportCount').textContent = logsToExport.length;
+
+            // Hiển thị modal xác nhận
+            const modal = new bootstrap.Modal(document.getElementById('confirmExportModal'));
+            modal.show();
+        }
+
+        // Xác nhận xuất dữ liệu
+        function confirmExport() {
+            const includeUnlabeled = document.getElementById('includeUnlabeled').checked;
+            const logsToExport = includeUnlabeled ? allLogsData : 
+                allLogsData.filter(log => log.type && log.confidence > 0.6);
+
+            fetch('/api/trigger-fine-tune', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    logs: logsToExport
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                const modal = new bootstrap.Modal(document.getElementById('confirmExportModal'));
+                modal.hide();
+
+                const resultModal = new bootstrap.Modal(document.getElementById('exportResultModal'));
+                const resultBody = document.getElementById('exportResultBody');
+
+                if (data.success) {
+                    resultBody.innerHTML = `
+                        <div class="alert alert-success">
+                            <strong>Success!</strong> ${data.message}
+                        </div>
+                        <p>Total logs exported: ${logsToExport.length}</p>
+                    `;
+                } else {
+                    resultBody.innerHTML = `
+                        <div class="alert alert-danger">
+                            <strong>Error!</strong> ${data.message}
+                        </div>
+                    `;
+                }
+
+                resultModal.show();
+            })
+            .catch(error => {
+                console.error('Error exporting for training:', error);
+                alert('Error exporting for training');
+            });
         }
 
         // Update log summary chart
@@ -308,12 +584,32 @@ DEFAULT_TEMPLATE = """
             });
         }
 
-        // Load initial data
+        // Cập nhật hàm loadDashboardData để lưu trữ allLogsData
+        function loadDashboardData() {
+            fetch('/api/dashboard-data')
+                .then(response => response.json())
+                .then(data => {
+                    updateLogSummary(data.log_summary);
+                    updateErrorDistribution(data.error_distribution);
+                    updateForecast(data.forecast);
+                    updateRecentLogs(data.recent_logs);
+
+                    // Lưu trữ logs để sử dụng cho gán nhãn
+                    allLogsData = data.recent_logs;
+                    updateLabelingTable(data.recent_logs);
+                })
+                .catch(error => console.error('Error loading dashboard data:', error));
+        }
+
+        // Thêm event listeners khi DOM loaded
         document.addEventListener('DOMContentLoaded', function() {
             loadDashboardData();
-
-            // Refresh data every 30 seconds
             setInterval(loadDashboardData, 30000);
+
+            // Gán sự kiện cho các nút
+            document.getElementById('applyLabelsBtn').addEventListener('click', applyLabels);
+            document.getElementById('exportForTrainingBtn').addEventListener('click', exportForTraining);
+            document.getElementById('confirmExportBtn').addEventListener('click', confirmExport);
         });
     </script>
 </body>
@@ -323,7 +619,7 @@ DEFAULT_TEMPLATE = """
 # Tạo HTML template ban đầu nếu chưa tồn tại
 template_path = os.path.join("templates", "dashboard.html")
 if not os.path.exists(template_path):
-    with open(template_path, "w") as f:
+    with open(template_path, "w", encoding="utf-8") as f:
         f.write(DEFAULT_TEMPLATE)
 
 
@@ -363,6 +659,58 @@ async def get_dashboard_data():
     except Exception as e:
         logger.error(f"Error preparing dashboard data: {e}")
         raise HTTPException(status_code=500, detail=f"Error preparing dashboard data: {str(e)}")
+
+
+@app.post("/api/manual-label", tags=["API"])
+async def manual_label_logs(request: Request):
+    """
+    Gán nhãn thủ công cho nhiều log cùng lúc
+    """
+    try:
+        data = await request.json()
+        if not data.get("logs"):
+            raise HTTPException(status_code=400, detail="No logs provided")
+
+        # Gửi yêu cầu đến log analyzer service
+        response = requests.post(
+            f"{LOG_ANALYZER_API}/manual-label",
+            json={"logs": data["logs"]}
+        )
+        response.raise_for_status()
+
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error sending manual label request: {e}")
+        raise HTTPException(status_code=503, detail="Log analyzer service unavailable")
+    except Exception as e:
+        logger.error(f"Error processing manual labels: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/trigger-fine-tune", tags=["API"])
+async def trigger_fine_tune(request: Request):
+    """
+    Kích hoạt quá trình fine-tune với dữ liệu đã gán nhãn
+    """
+    try:
+        data = await request.json()
+        if not data.get("logs"):
+            raise HTTPException(status_code=400, detail="No logs provided")
+
+        # Gửi yêu cầu đến log analyzer service
+        response = requests.post(
+            f"{LOG_ANALYZER_API}/trigger-fine-tune",
+            json={"logs": data["logs"]}
+        )
+        response.raise_for_status()
+
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error sending fine-tune request: {e}")
+        raise HTTPException(status_code=503, detail="Log analyzer service unavailable")
+    except Exception as e:
+        logger.error(f"Error triggering fine-tune: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 def prepare_dashboard_data(log_history, forecast):
@@ -442,4 +790,4 @@ def prepare_dashboard_data(log_history, forecast):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("dashboard_service:app", host="0.0.0.0", port=8001, reload=True)
+    uvicorn.run("dashboard_service:app", host="0.0.0.0", port=8002, reload=True)

@@ -64,6 +64,19 @@ class LogQuery(BaseModel):
 class ForecastInput(BaseModel):
     periods: int = Field(30, description="Số phút muốn dự đoán trong tương lai")
 
+# Lưu log_history vào tệp sau khi cập nhật
+def save_log_history():
+    try:
+        # Xử lý NaN trước khi lưu vào file
+        log_history_clean = [
+            {k: (None if pd.isna(v) else v) for k, v in log_item.items()}
+            for log_item in log_analyzer.log_history
+        ]
+
+        with open("data/log_history.json", "w") as f:
+            json.dump(log_history_clean, f)
+    except Exception as e:
+        logger.error(f"Error saving log history: {e}")
 
 # API endpoints
 @app.post("/analyze", tags=["Analysis"])
@@ -144,8 +157,11 @@ async def get_log_history(limit: int = 100):
         if log_history.empty:
             return {"logs": [], "count": 0}
 
+        # Xử lý NaN trước khi chuyển đổi
+        log_history_clean = log_history.fillna("")
+
         # Giới hạn số lượng kết quả
-        logs = log_history.tail(limit).to_dict(orient="records")
+        logs = log_history_clean.tail(limit).to_dict(orient="records")
 
         return {
             "logs": logs,
@@ -222,65 +238,119 @@ async def trigger_fine_tuning():
 
 
 # Thêm trong file log_analyzer_service.py
-
-class ManualLabelInput(BaseModel):
-    log_id: str = Field(..., description="ID của log cần gán nhãn")
-    type: str = Field(..., description="Loại lỗi để gán (database, server, network, application, security)")
-    confidence: float = Field(1.0, description="Độ tin cậy của nhãn (0.0-1.0)")
+# Thêm model mới
+class ManualLabelBatchInput(BaseModel):
+    logs: List[Dict[str, Any]] = Field(..., description="Danh sách log và nhãn mới")
 
 
+class TriggerFineTuneInput(BaseModel):
+    logs: List[Dict[str, Any]] = Field(..., description="Danh sách log để fine-tune")
+
+# Thêm endpoint mới
 @app.post("/manual-label", tags=["ML"])
-async def manual_label_log(input_data: ManualLabelInput):
-    """
-    Gán nhãn thủ công cho log để cải thiện dữ liệu training
-    """
+async def manual_label_batch(input_data: ManualLabelBatchInput):
+    """Gán nhãn hàng loạt cho log"""
     try:
-        # Lấy lịch sử log
-        log_history = log_analyzer.get_log_history()
-
-        if log_history.empty:
-            return {
-                "success": False,
-                "message": "Không có log nào trong lịch sử"
-            }
-
-        # Kiểm tra loại lỗi có hợp lệ không
-        if input_data.type not in log_analyzer.labels:
-            return {
-                "success": False,
-                "message": f"Loại lỗi không hợp lệ. Các loại lỗi hợp lệ: {', '.join(log_analyzer.labels)}"
-            }
-
-        # Thêm vào buffer để fine-tune
         global log_buffer
 
-        # Tìm log theo ID (hoặc có thể dựa vào timestamp nếu không có ID)
-        matching_logs = [log for log in log_analyzer.log_history
-                         if "id" in log and log["id"] == input_data.log_id]
+        # Đảm bảo log_history là DataFrame
+        if isinstance(log_analyzer.log_history, list):
+            # Chuyển đổi list thành DataFrame
+            log_df = pd.DataFrame(log_analyzer.log_history)
+        else:
+            log_df = log_analyzer.log_history
 
-        if not matching_logs:
-            return {
-                "success": False,
-                "message": f"Không tìm thấy log với ID {input_data.log_id}"
-            }
+        # Xử lý từng log đầu vào
+        for log_input in input_data.logs:
+            log_id = log_input.get("log_id")
 
-        # Cập nhật nhãn và độ tin cậy
-        log = matching_logs[0].copy()
-        log["type"] = input_data.type
-        log["confidence"] = input_data.confidence
-        log["manually_labeled"] = True
+            # Tìm và cập nhật log
+            if isinstance(log_analyzer.log_history, list):
+                # Xử lý nếu log_history là list
+                for i, log in enumerate(log_analyzer.log_history):
+                    if log.get("timestamp") == log_id:
+                        log_analyzer.log_history[i]["type"] = log_input["type"]
+                        log_analyzer.log_history[i]["confidence"] = float(log_input["confidence"])
+                        log_analyzer.log_history[i]["manually_labeled"] = True
 
-        # Thêm vào buffer
-        log_buffer.append(log)
+                        log_copy = log_analyzer.log_history[i].copy()
+                        # Đảm bảo không có giá trị NaN
+                        for key, value in log_copy.items():
+                            if pd.isna(value):
+                                log_copy[key] = None
+                        log_buffer.append(log_copy)
+                        break
+            else:
+                # Xử lý nếu log_history là DataFrame
+                mask = log_df["timestamp"] == log_id
+                if mask.any():
+                    log_analyzer.log_history.loc[mask, "type"] = log_input["type"]
+                    log_analyzer.log_history.loc[mask, "confidence"] = float(log_input["confidence"])
+                    log_analyzer.log_history.loc[mask, "manually_labeled"] = True
+
+                    # Thêm vào buffer
+                    log_row = log_analyzer.log_history[mask].to_dict('records')[0]
+                    # Đảm bảo không có giá trị NaN
+                    for key, value in log_row.items():
+                        if pd.isna(value):
+                            log_row[key] = None
+                    log_buffer.append(log_row)
+
+        # Lưu log_history
+        save_log_history()
 
         return {
             "success": True,
-            "message": f"Đã gán nhãn '{input_data.type}' cho log ID {input_data.log_id}"
+            "message": f"Applied labels to {len(input_data.logs)} logs",
+            "total_labeled": len(log_buffer)
         }
-
     except Exception as e:
-        logger.error(f"Error manual labeling log: {e}")
-        raise HTTPException(status_code=500, detail=f"Lỗi khi gán nhãn thủ công: {str(e)}")
+        logger.error(f"Error in batch labeling: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/trigger-fine-tune", tags=["ML"])
+async def trigger_fine_tune_with_data(input_data: TriggerFineTuneInput):
+    """Kích hoạt fine-tune với dữ liệu cụ thể"""
+    try:
+        if not input_data.logs:
+            return {
+                "success": False,
+                "message": "No logs provided"
+            }
+
+        # Chuẩn bị dữ liệu
+        fine_tune_data = pd.DataFrame([
+            {
+                "message": log["message"],
+                "label": log.get("type", "unknown")
+            }
+            for log in input_data.logs
+            if log.get("type") in log_analyzer.labels  # Chỉ lấy các log có nhãn hợp lệ
+        ])
+
+        if fine_tune_data.empty:
+            return {
+                "success": False,
+                "message": "No valid labeled logs found"
+            }
+
+        # Thực hiện fine-tune
+        result = fine_tuner.fine_tune(fine_tune_data)
+
+        if result:
+            return {
+                "success": True,
+                "message": f"Fine-tuned model with {len(fine_tune_data)} samples"
+            }
+        else:
+            return {
+                "success": False,
+                "message": "Fine-tuning failed"
+            }
+    except Exception as e:
+        logger.error(f"Error in fine-tuning with provided data: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/status", tags=["System"])
 async def get_system_status():
